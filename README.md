@@ -210,193 +210,175 @@ uv add --dev pytest
 uv run python -c "print('ReAct agent project ready')"
 ```
 
-## Manual JSON Schemas
+## ReAct Prompt (Tools as Plain Text)
 
-When calling an LLM with tool-use support (such as Ollama or the OpenAI-compatible API), the model needs a precise description of each tool in a structured format. This description is the **JSON schema**, and it tells the model:
+This version of the project does **not** pass tools through `ollama.chat(..., tools=...)`.
+Instead, tools are injected into the prompt as plain text, and the model follows a strict ReAct output format.
 
-- What the tool is called (`name`)
-- What it does (`description`)
-- What inputs it accepts (`parameters`) — their names, types, and whether they are required
+The core idea:
 
-### Schema Structure
+1. Build a tool list from Python functions.
+2. Put that tool list inside the prompt.
+3. Ask the model to emit `Action:` and `Action Input:` lines.
+4. Parse those lines with regex.
+5. Execute the tool in Python.
+6. Feed back `Observation:` into the scratchpad.
+7. Repeat until `Final Answer:` appears.
 
-Each tool entry follows this shape:
+### Tool Descriptions Are Generated from Functions
 
-```json
-{
-  "type": "function",
-  "function": {
-    "name": "<function_name>",
-    "description": "<what the function does>",
-    "parameters": {
-      "type": "object",
-      "properties": {
-        "<param_name>": {
-          "type": "<json_type>",
-          "description": "<what the param means>"
-        }
-      },
-      "required": ["<param_name>"]
-    }
-  }
-}
-```
-
-### Example from This Project
+Tool metadata is created with `inspect`:
 
 ```python
-tools_for_llm = [
-    {
-        "type": "function",
-        "function": {
-            "name": "get_product_price",
-            "description": "Look up the price of a product in the catalog.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "product": {
-                        "type": "string",
-                        "description": "The product name, e.g. 'laptop', 'headphones', 'keyboard'",
-                    },
-                },
-                "required": ["product"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "apply_discount",
-            "description": "Apply a discount tier to a price and return the final price. Available tiers: bronze, silver, gold.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "price": {"type": "number", "description": "The original price"},
-                    "discount_tier": {
-                        "type": "string",
-                        "description": "The discount tier: 'bronze', 'silver', or 'gold'",
-                    },
-                },
-                "required": ["price", "discount_tier"],
-            },
-        },
-    },
-]
+def get_tool_descriptions(tools_dict):
+    descriptions = []
+    for tool_name, tool_function in tools_dict.items():
+        original_function = getattr(tool_function, "__wrapped__", tool_function)
+        signature = inspect.signature(original_function)
+        docstring = inspect.getdoc(tool_function) or ""
+        descriptions.append(f"{tool_name}{signature} - {docstring}")
+    return "\n".join(descriptions)
 ```
 
-These schemas are passed directly to `ollama.chat(model=MODEL, tools=tools_for_llm, messages=messages)`. The LLM reads them at inference time to decide which tool to call and with what arguments.
+This produces plain-text tool lines such as:
 
-### Ollama Auto-Schema Shortcut
-
-Ollama can also generate schemas automatically if you pass the Python functions directly:
-
-```python
-tools_for_llm = [get_product_price, apply_discount]
+```text
+get_product_price(product: str) -> float - Look up the price of a product in the catalog.
+apply_discount(price: float, discount_tier: str) -> float - Apply a discount tier to a price and return the final price.
 ```
 
-This requires **Google-style docstrings** with an `Args:` section so Ollama can parse parameter descriptions:
+### ReAct Prompt Template
 
-```python
-def get_product_price(product: str) -> float:
-    """Look up the price of a product in the catalog.
+The model is guided with one large prompt string containing:
 
-    Args:
-        product: The product name, e.g. 'laptop', 'headphones', 'keyboard'.
+- Strict tool-use rules
+- Tool descriptions
+- Allowed action names
+- Required ReAct format (`Thought`, `Action`, `Action Input`, `Observation`, `Final Answer`)
 
-    Returns:
-        The price of the product, or 0 if not found.
-    """
+```text
+Question: the input question you must answer
+Thought: you should always think about what to do
+Action: the action to take, should be one of [get_product_price, apply_discount]
+Action Input: the input to the action, as comma separated values
+Observation: the result of the action
+... (repeat)
+Thought: I now know the final answer
+Final Answer: the final answer to the original input question
 ```
 
-The manual JSON version is kept in this project to make the hidden machinery visible.
+### Agent Loop in This Pattern
 
-### When to Write Schemas Manually
+1. Create `full_prompt = prompt + scratchpad`.
+2. Call `ollama.chat()` without the `tools` parameter.
+3. Stop generation at `\nObservation` so Python controls the real observation.
+4. Parse `Final Answer` first.
+5. If missing, parse `Action` + `Action Input`.
+6. Execute selected tool from a Python dictionary.
+7. Append `Observation` to `scratchpad` and continue.
 
-| Situation | Recommendation |
-|---|---|
-| Learning how tool-calling works | Manual — see exactly what the LLM receives |
-| Docstrings don't follow Google format | Manual — full control over descriptions |
-| Using a framework that auto-generates them | Auto (LangChain `@tool`, Ollama direct functions) |
-| Complex nested parameter types | Manual — auto-generation may miss nuance |
-| Production code with many tools | Auto + validation to reduce boilerplate |
+### Why This Is Useful
 
----
+- Shows the raw mechanics of ReAct without framework abstraction.
+- Makes every orchestration step explicit (prompting, parsing, dispatch, loop state).
+- Great for learning and debugging agent behavior.
 
-## Manual JSON Schemas vs LangChain Tool Abstraction
+### Tradeoffs
 
-This project deliberately avoids LangChain to expose the low-level mechanics. The table below maps each manual step to its LangChain equivalent.
+- More fragile than native tool-calling because regex depends on strict model formatting.
+- Requires careful prompt design and defensive parsing.
+- Easier to inspect, harder to scale for many tools.
 
-| Step | Manual (this project) | LangChain Abstraction |
-|---|---|---|
-| **Schema definition** | Hand-written `tools_for_llm` JSON dict | `@tool` decorator auto-generates from type hints + docstring |
-| **Binding tools to LLM** | Pass `tools=tools_for_llm` to `ollama.chat()` | `llm.bind_tools([get_product_price, apply_discount])` |
-| **Invoking the LLM** | `ollama.chat(model=MODEL, tools=..., messages=...)` | `llm_with_tools.invoke(messages)` |
-| **Reading tool name** | `tool_call.function.name` (attribute access on Ollama object) | `tool_call.get("name")` (dict access on LangChain `ToolCall`) |
-| **Reading tool args** | `tool_call.function.arguments` | `tool_call.get("args")` |
-| **Executing the tool** | `tool_to_use(**tool_args)` (direct Python call) | `tool.invoke(tool_args)` |
-| **Tracing / observability** | Manual `@traceable` on every function | LangChain callbacks + LangSmith auto-instrumentation |
-| **Tool registry** | Plain `dict` mapping name → function | `ToolExecutor` or `tool_node` in LangGraph |
+For this repository's educational goal, this plain-text ReAct approach is intentional and makes the "agent under the hood" behavior fully visible.
 
-### Code Comparison
+## LangChain Tool Abstraction vs Manual JSON Parsing vs ReAct Prompt
 
-#### Schema definition
+This section compares three common agent-tool integration styles.
 
-```python
-# Manual
-tools_for_llm = [
-    {
-        "type": "function",
-        "function": {
-            "name": "get_product_price",
-            "description": "Look up the price of a product in the catalog.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "product": {"type": "string", "description": "..."},
-                },
-                "required": ["product"],
-            },
-        },
-    }
-]
+| Aspect | LangChain Tool Abstraction | Manual JSON Tool Parsing | ReAct Prompt (Plain Text Tools) |
+|---|---|---|---|
+| Tool definition | `@tool` decorator + type hints/docstrings | Hand-written JSON schemas in `tools=[...]` | Plain-text tool descriptions embedded in prompt |
+| LLM call style | `llm.bind_tools(...).invoke(...)` | `ollama.chat(..., tools=tools_for_llm, ...)` | `ollama.chat(..., messages=[prompt])` (no `tools=`) |
+| Tool-call extraction | Framework object (`tool_calls`) | JSON tool-call objects from model response | Regex parse of `Action` and `Action Input` lines |
+| Execution path | `tool.invoke(...)` via framework wrappers | Python dispatch table + parsed JSON args | Python dispatch table + parsed text args |
+| Reliability | High (structured orchestration) | High-Medium (structured, but hand-rolled) | Medium-Low (format-sensitive prompt parsing) |
+| Transparency for learning | Medium | High | Very high |
+| Boilerplate | Low | Medium-High | Medium |
+| Best use | Production speed + maintainability | Low-level control with native tool-calling | Teaching/demo of ReAct internals |
 
-# LangChain
-from langchain_core.tools import tool
+### Visual Comparison
 
-@tool
-def get_product_price(product: str) -> float:
-    """Look up the price of a product in the catalog."""
-    ...
+```mermaid
+flowchart LR
+    subgraph L[LangChain Tool Abstraction]
+        L1[User Input] --> L2[Prompt + Runnable Chain]
+        L2 --> L3[LLM bound with tools]
+        L3 --> L4[tool_calls object]
+        L4 --> L5[tool.invoke]
+        L5 --> L6[Framework-managed loop]
+        L6 --> L7[Final Answer]
+    end
+
+    subgraph J[Manual JSON Tool Parsing]
+        J1[User Input] --> J2[messages + tools JSON schema]
+        J2 --> J3[LLM native tool call response]
+        J3 --> J4[Read function.name + arguments]
+        J4 --> J5[Python function dispatch]
+        J5 --> J6[Append tool observation]
+        J6 --> J7[Final Answer]
+    end
+
+    subgraph R[ReAct Prompt Plain Text]
+        R1[User Input] --> R2[Prompt includes tool list text]
+        R2 --> R3[LLM emits Thought/Action/Action Input]
+        R3 --> R4[Regex parse Action]
+        R4 --> R5[Python function dispatch]
+        R5 --> R6[Append Observation to scratchpad]
+        R6 --> R7[Final Answer]
+    end
 ```
 
-#### Binding and invoking
+### Diagram: LangChain Tool Abstraction
 
-```python
-# Manual
-response = ollama.chat(model=MODEL, tools=tools_for_llm, messages=messages)
-
-# LangChain
-llm_with_tools = llm.bind_tools([get_product_price, apply_discount])
-response = llm_with_tools.invoke(messages)
+```mermaid
+flowchart TD
+    A[Question] --> B[LangChain prompt/runnable]
+    B --> C[LLM with bind_tools]
+    C --> D[Structured tool_calls]
+    D --> E[tool.invoke]
+    E --> F[State update]
+    F --> C
+    C --> G[Final Answer]
 ```
 
-#### Executing the selected tool
+### Diagram: Manual JSON Tool Parsing
 
-```python
-# Manual
-tool_name = tool_call.function.name
-tool_args = tool_call.function.arguments
-observation = tools_dict[tool_name](**tool_args)
-
-# LangChain
-tool_name = tool_call.get("name")
-tool_args = tool_call.get("args")
-observation = tools_dict[tool_name].invoke(tool_args)
+```mermaid
+flowchart TD
+    A[Question] --> B[ollama.chat with tools JSON]
+    B --> C[tool_call.function.name]
+    C --> D[tool_call.function.arguments]
+    D --> E[Python dispatch map]
+    E --> F[Observation message]
+    F --> B
+    B --> G[Final Answer]
 ```
 
-### Key Takeaways
+### Diagram: ReAct Prompt Parsing
 
-- **Manual schemas** give full visibility but require more boilerplate. Every parameter description must be written by hand.
-- **LangChain `@tool`** reduces ceremony and keeps the schema co-located with the implementation, but hides what the LLM actually receives.
-- Both approaches produce functionally equivalent behaviour — the LLM sees the same JSON either way.
-- For learning or debugging, the manual approach is invaluable. For production systems with many tools, the abstraction layer saves significant effort.
+```mermaid
+flowchart TD
+    A[Question] --> B[Single prompt with tool text]
+    B --> C[LLM output: Thought/Action/Input]
+    C --> D[Regex parser]
+    D --> E[Python dispatch map]
+    E --> F[Append Observation to scratchpad]
+    F --> B
+    B --> G[Final Answer]
+```
+
+### Quick Guidance
+
+- Choose **LangChain abstraction** for robust production workflows and lower maintenance.
+- Choose **manual JSON parsing** when you want native tool-calling with full control of schemas.
+- Choose **ReAct prompt parsing** when your goal is to understand and teach the exact internal reasoning/acting loop.
