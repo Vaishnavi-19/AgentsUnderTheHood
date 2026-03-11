@@ -209,3 +209,194 @@ uv add openai
 uv add --dev pytest
 uv run python -c "print('ReAct agent project ready')"
 ```
+
+## Manual JSON Schemas
+
+When calling an LLM with tool-use support (such as Ollama or the OpenAI-compatible API), the model needs a precise description of each tool in a structured format. This description is the **JSON schema**, and it tells the model:
+
+- What the tool is called (`name`)
+- What it does (`description`)
+- What inputs it accepts (`parameters`) — their names, types, and whether they are required
+
+### Schema Structure
+
+Each tool entry follows this shape:
+
+```json
+{
+  "type": "function",
+  "function": {
+    "name": "<function_name>",
+    "description": "<what the function does>",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "<param_name>": {
+          "type": "<json_type>",
+          "description": "<what the param means>"
+        }
+      },
+      "required": ["<param_name>"]
+    }
+  }
+}
+```
+
+### Example from This Project
+
+```python
+tools_for_llm = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_product_price",
+            "description": "Look up the price of a product in the catalog.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "product": {
+                        "type": "string",
+                        "description": "The product name, e.g. 'laptop', 'headphones', 'keyboard'",
+                    },
+                },
+                "required": ["product"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "apply_discount",
+            "description": "Apply a discount tier to a price and return the final price. Available tiers: bronze, silver, gold.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "price": {"type": "number", "description": "The original price"},
+                    "discount_tier": {
+                        "type": "string",
+                        "description": "The discount tier: 'bronze', 'silver', or 'gold'",
+                    },
+                },
+                "required": ["price", "discount_tier"],
+            },
+        },
+    },
+]
+```
+
+These schemas are passed directly to `ollama.chat(model=MODEL, tools=tools_for_llm, messages=messages)`. The LLM reads them at inference time to decide which tool to call and with what arguments.
+
+### Ollama Auto-Schema Shortcut
+
+Ollama can also generate schemas automatically if you pass the Python functions directly:
+
+```python
+tools_for_llm = [get_product_price, apply_discount]
+```
+
+This requires **Google-style docstrings** with an `Args:` section so Ollama can parse parameter descriptions:
+
+```python
+def get_product_price(product: str) -> float:
+    """Look up the price of a product in the catalog.
+
+    Args:
+        product: The product name, e.g. 'laptop', 'headphones', 'keyboard'.
+
+    Returns:
+        The price of the product, or 0 if not found.
+    """
+```
+
+The manual JSON version is kept in this project to make the hidden machinery visible.
+
+### When to Write Schemas Manually
+
+| Situation | Recommendation |
+|---|---|
+| Learning how tool-calling works | Manual — see exactly what the LLM receives |
+| Docstrings don't follow Google format | Manual — full control over descriptions |
+| Using a framework that auto-generates them | Auto (LangChain `@tool`, Ollama direct functions) |
+| Complex nested parameter types | Manual — auto-generation may miss nuance |
+| Production code with many tools | Auto + validation to reduce boilerplate |
+
+---
+
+## Manual JSON Schemas vs LangChain Tool Abstraction
+
+This project deliberately avoids LangChain to expose the low-level mechanics. The table below maps each manual step to its LangChain equivalent.
+
+| Step | Manual (this project) | LangChain Abstraction |
+|---|---|---|
+| **Schema definition** | Hand-written `tools_for_llm` JSON dict | `@tool` decorator auto-generates from type hints + docstring |
+| **Binding tools to LLM** | Pass `tools=tools_for_llm` to `ollama.chat()` | `llm.bind_tools([get_product_price, apply_discount])` |
+| **Invoking the LLM** | `ollama.chat(model=MODEL, tools=..., messages=...)` | `llm_with_tools.invoke(messages)` |
+| **Reading tool name** | `tool_call.function.name` (attribute access on Ollama object) | `tool_call.get("name")` (dict access on LangChain `ToolCall`) |
+| **Reading tool args** | `tool_call.function.arguments` | `tool_call.get("args")` |
+| **Executing the tool** | `tool_to_use(**tool_args)` (direct Python call) | `tool.invoke(tool_args)` |
+| **Tracing / observability** | Manual `@traceable` on every function | LangChain callbacks + LangSmith auto-instrumentation |
+| **Tool registry** | Plain `dict` mapping name → function | `ToolExecutor` or `tool_node` in LangGraph |
+
+### Code Comparison
+
+#### Schema definition
+
+```python
+# Manual
+tools_for_llm = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_product_price",
+            "description": "Look up the price of a product in the catalog.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "product": {"type": "string", "description": "..."},
+                },
+                "required": ["product"],
+            },
+        },
+    }
+]
+
+# LangChain
+from langchain_core.tools import tool
+
+@tool
+def get_product_price(product: str) -> float:
+    """Look up the price of a product in the catalog."""
+    ...
+```
+
+#### Binding and invoking
+
+```python
+# Manual
+response = ollama.chat(model=MODEL, tools=tools_for_llm, messages=messages)
+
+# LangChain
+llm_with_tools = llm.bind_tools([get_product_price, apply_discount])
+response = llm_with_tools.invoke(messages)
+```
+
+#### Executing the selected tool
+
+```python
+# Manual
+tool_name = tool_call.function.name
+tool_args = tool_call.function.arguments
+observation = tools_dict[tool_name](**tool_args)
+
+# LangChain
+tool_name = tool_call.get("name")
+tool_args = tool_call.get("args")
+observation = tools_dict[tool_name].invoke(tool_args)
+```
+
+### Key Takeaways
+
+- **Manual schemas** give full visibility but require more boilerplate. Every parameter description must be written by hand.
+- **LangChain `@tool`** reduces ceremony and keeps the schema co-located with the implementation, but hides what the LLM actually receives.
+- Both approaches produce functionally equivalent behaviour — the LLM sees the same JSON either way.
+- For learning or debugging, the manual approach is invaluable. For production systems with many tools, the abstraction layer saves significant effort.
